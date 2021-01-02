@@ -8,11 +8,21 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+
+	"github.com/pkg/errors"
 )
 
 func main() {
+	if len(os.Args) < 3 {
+		fmt.Fprintf(os.Stderr, "pl <count> <command>")
+		os.Exit(1)
+		return
+	}
+
+	mtx := &sync.Mutex{}
+
 	processCount, err := strconv.Atoi(os.Args[1])
-	check(err, "%s is not a valid number: %v", os.Args[1], err)
+	check(mtx, err, "%s is not a valid number: %v", os.Args[1], err)
 
 	wg := &sync.WaitGroup{}
 
@@ -20,17 +30,23 @@ func main() {
 		cmd := exec.Command(os.Args[2], os.Args[3:]...)
 
 		stdout, err := cmd.StdoutPipe()
-		check(err, "failed to open stdout pipe: %v", err)
+		check(mtx, err, "failed to open stdout pipe: %v", err)
 
-		go copyOutput(i, stdout, os.Stdout)
+		go func() {
+			err := copyOutput(mtx, i, stdout, os.Stdout)
+			check(mtx, err, "error in stdout")
+		}()
 
 		stderr, err := cmd.StderrPipe()
-		check(err, "failed to open stdout pipe: %v", err)
+		check(mtx, err, "failed to open stdout pipe: %v", err)
 
-		go copyOutput(i, stderr, os.Stderr)
+		go func() {
+			err := copyOutput(mtx, i, stderr, os.Stderr)
+			check(mtx, err, "error in stdout")
+		}()
 
 		err = cmd.Start()
-		check(err, "failed to start command: %v", err)
+		check(mtx, err, "failed to start command: %v", err)
 
 		defer func() {
 			err := cmd.Process.Kill()
@@ -51,22 +67,34 @@ func main() {
 	wg.Wait()
 }
 
-func copyOutput(num int, src io.Reader, dst io.Writer) {
+func copyOutput(mtx *sync.Mutex, num int, src io.Reader, dst io.Writer) error {
 	bufSrc := bufio.NewReader(src)
 	for {
 
 		line, _, err := bufSrc.ReadLine()
-		if err == io.EOF {
-			return
+		if errors.Is(err, io.EOF) {
+			return nil
 		}
-		check(err, "failed to read line: %v\n", err)
-		fmt.Fprintf(dst, "%6s%s\n", fmt.Sprintf("%d | ", num), line)
-		// io.Copy(dst, src)
+		if errors.Is(err, os.ErrClosed) {
+			return nil
+		}
+		if err != nil {
+			return errors.Wrap(err, "failed to read line")
+		}
+
+		mtx.Lock()
+		_, err = fmt.Fprintf(dst, "%6s%s\n", fmt.Sprintf("%d | ", num), line)
+		mtx.Unlock()
+		if err != nil {
+			return errors.Wrap(err, "failed to write output")
+		}
 	}
 }
 
-func check(err error, message string, a ...interface{}) {
+func check(mtx *sync.Mutex, err error, message string, a ...interface{}) {
 	if err != nil {
+		mtx.Lock()
+		defer mtx.Unlock()
 		fmt.Fprintf(os.Stderr, message+"\n", a...)
 		os.Exit(1)
 	}
